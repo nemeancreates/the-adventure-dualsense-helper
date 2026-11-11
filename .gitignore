@@ -1,0 +1,11 @@
+# personal and machine files: never shared
+helper_log*.txt
+mic_samples/
+sound_log/
+flick.json
+__pycache__/
+*.pyc
+# build output
+build/
+dist/
+*.spec

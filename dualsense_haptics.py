@@ -77,10 +77,68 @@ class _Tee:
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-try:
-    ctypes.windll.user32.SetProcessDPIAware()  # physical pixels, so 6 px really is 6 px
+try:  # physical pixels on every monitor, so 6 px really is 6 px (per-monitor aware; older Windows: system aware)
+    ctypes.windll.user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+    if not ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+        ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
-    pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# ---- reading a small part of the screen quickly, on any monitor ----------------------------------------------
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32), ("biHeight", ctypes.c_int32),
+                ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32), ("biClrImportant", ctypes.c_uint32)]
+
+
+_u32, _gdi = ctypes.windll.user32, ctypes.windll.gdi32
+_u32.GetDC.restype = ctypes.c_void_p
+_u32.GetDC.argtypes = [ctypes.c_void_p]
+_u32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_gdi.CreateCompatibleDC.restype = ctypes.c_void_p
+_gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+_gdi.CreateCompatibleBitmap.restype = ctypes.c_void_p
+_gdi.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+_gdi.SelectObject.restype = ctypes.c_void_p
+_gdi.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_gdi.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                        ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+_gdi.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.c_void_p, ctypes.c_uint]
+_gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+_gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+
+
+def virtual_origin():
+    """Top-left of the whole desktop (all monitors) in screen coordinates: where an all-screens grab starts."""
+    return _u32.GetSystemMetrics(76), _u32.GetSystemMetrics(77)  # SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN
+
+
+def grab_region(left, top, right, bottom):
+    """RGB pixels of one small screen rectangle (screen coordinates, any monitor), straight from the screen: a few
+    milliseconds, where an all-screens screenshot cropped afterwards took about 87 ms."""
+    w, h = int(right - left), int(bottom - top)
+    hdc = _u32.GetDC(None)
+    mdc = _gdi.CreateCompatibleDC(hdc)
+    bmp = _gdi.CreateCompatibleBitmap(hdc, w, h)
+    old = _gdi.SelectObject(mdc, bmp)
+    try:
+        _gdi.BitBlt(mdc, 0, 0, w, h, hdc, int(left), int(top), 0x00CC0020)  # SRCCOPY
+        bi = _BITMAPINFOHEADER(ctypes.sizeof(_BITMAPINFOHEADER), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not _gdi.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bi), 0):
+            raise OSError("GetDIBits failed")
+        return np.frombuffer(buf.raw, dtype=np.uint8).reshape(h, w, 4)[:, :, 2::-1].copy()  # BGRA -> RGB
+    finally:
+        _gdi.SelectObject(mdc, old)
+        _gdi.DeleteObject(bmp)
+        _gdi.DeleteDC(mdc)
+        _u32.ReleaseDC(None, hdc)
 
 RATE = 48000
 CHUNK = 480          # 10 ms of audio per buffer
@@ -217,6 +275,24 @@ def canon_strip(arr, cm, w, yc):
     return out
 
 
+def normalize_strip(arr):
+    """Something see-through and dark over the corner (another addon's window, a game fade) dims every square by the
+    same amount: black stays black, pure colours drop (244 came out as 98). The magenta and green marker squares show
+    by how much, so the whole strip is brightened back before it is read. Returns (strip, trustworthy)."""
+    m = arr[3, 15].astype(float)
+    g = arr[3, 21].astype(float)
+    ok = (m[0] > 40 and m[2] > 40 and m[1] < 0.35 * min(m[0], m[2])
+          and g[1] > 40 and g[0] < 0.35 * g[1] and g[2] < 0.35 * g[1]
+          and abs(m[0] - m[2]) < 0.25 * max(m[0], m[2]))
+    if not ok:
+        return arr, False
+    ref = (m[0] + m[2] + g[1]) / 3.0
+    if ref >= 225:
+        return arr, True  # (full brightness already)
+    scale = min(4.0, 250.0 / ref)
+    return np.clip(arr.astype(float) * scale, 0, 255).astype(np.uint8), True
+
+
 def decode(arr, x, y):
     """(weak, strong, rain, wind) from the strip at x, y, or None if the markers aren't there.
     weak/strong are 0..2 (effects); rain and wind are 0..1 (the weather feel, carried in the blue of the two
@@ -289,6 +365,12 @@ def fish_flag(arr, x, y):
 def menu_flag(arr, x, y):
     """Square 14's blue: a menu is open in the game (ours, the map, bags, a trade...) - the touchpad is a mouse."""
     b = _bits(arr, x, y, 14)
+    return bool(b and b[2])
+
+
+def map_flag(arr, x, y):
+    """Square 11's blue: the world map is open (a touchpad click on its left / right side zooms out / in)."""
+    b = _bits(arr, x, y, 11)
     return bool(b and b[2])
 
 
@@ -664,6 +746,16 @@ def set_clipboard(text):
     user32.SetClipboardData(13, h)  # CF_UNICODETEXT
     user32.CloseClipboard()
     return True
+
+
+def steam_running():
+    """Is Steam running? (its PlayStation controller support takes the DualSense over)"""
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH"], capture_output=True, text=True,
+                             timeout=5, creationflags=0x08000000).stdout
+        return "steam.exe" in out.lower()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def game_in_front():
@@ -1307,11 +1399,18 @@ class PadWatcher(threading.Thread):
         """The touchpad as a laptop touchpad: slide to move the pointer (faster slides go further), click = left click."""
         if not contact & 0x80:  # a finger is down
             last = getattr(self, "_mlast", None)
-            if last is not None:
+            self._mdown_reports = getattr(self, "_mdown_reports", 0) + 1
+            if last is not None and self._mdown_reports > 3:  # (the first few readings of a touch wobble: skipped)
                 dx, dy = tx - last[0], ty - last[1]
-                speed = 0.5 * (0.9 + min(2.2, (dx * dx + dy * dy) ** 0.5 / 14.0))  # (halved 11-10: was too fast)
-                self._macc = (getattr(self, "_macc", (0.0, 0.0))[0] + dx * speed,
-                              getattr(self, "_macc", (0.0, 0.0))[1] + dy * speed)
+                if abs(dx) > 90 or abs(dy) > 90:
+                    dx, dy = 0, 0  # a sudden leap is a misread or a second finger, not a slide: ignored
+                # smoothed with the step before, slow by default, a little faster for a quick slide
+                pdx, pdy = getattr(self, "_mprev", (0.0, 0.0))
+                sx, sy = (dx + pdx) / 2.0, (dy + pdy) / 2.0
+                self._mprev = (dx, dy)
+                speed = 0.3 * (0.8 + min(1.2, (sx * sx + sy * sy) ** 0.5 / 20.0))  # (11-11: slower again, no jumps)
+                self._macc = (getattr(self, "_macc", (0.0, 0.0))[0] + sx * speed,
+                              getattr(self, "_macc", (0.0, 0.0))[1] + sy * speed)
                 mx, my = int(self._macc[0]), int(self._macc[1])
                 if mx or my:
                     mouse(mx, my)
@@ -1319,6 +1418,26 @@ class PadWatcher(threading.Thread):
             self._mlast = (tx, ty)
         else:
             self._mlast = None
+            self._mdown_reports = 0
+            self._mprev = (0.0, 0.0)
+            self._macc = (0.0, 0.0)
+        # a click that was already held when the menu opened (the press that opened the map) is not a click: its
+        # release used to land on the map and jump it to another zone
+        if getattr(self, "_mheld", False):
+            if not click:
+                self._mheld = False
+            return
+        # the world map: a click on the pad's left side zooms out, right side zooms in, the middle is a left click
+        if click and not getattr(self, "_mdown", False) and getattr(self, "map_open", False) and not contact & 0x80:
+            if tx < 640 or tx > 1280:
+                self._mzoom = True
+                mouse(flags=0x0800, wheel=-120 if tx < 640 else 120)
+                self._mdown = True
+                return
+        if not click and getattr(self, "_mzoom", False):
+            self._mzoom = False
+            self._mdown = False
+            return
         if click != getattr(self, "_mdown", False):
             self._mdown = click
             mouse(flags=0x0002 if click else 0x0004)
@@ -1342,11 +1461,22 @@ class PadWatcher(threading.Thread):
         if not (self.whandle and self.usb):
             return False
         pattern = [0x00, 0x04, 0x0A, 0x15, 0x1B, 0x1F][max(0, min(5, count))]
+        written = wintypes.DWORD()
+        if not getattr(self, "_leds_released", False):
+            # once per connection, as its own message first: release the lights from the controller's start-up
+            # show (the way that lit the dots in the 11-11 test)
+            rel = bytearray(max(self.out_length, 48))
+            rel[0] = 0x02
+            rel[39] = 0x02           # valid flag 2: light-bar setup
+            rel[42] = 0x02           # light-bar setup: hand the LEDs to the host
+            ctypes.windll.kernel32.WriteFile(ctypes.c_void_p(self.whandle), bytes(rel[:self.out_length]),
+                                             self.out_length, ctypes.byref(written), None)
+            self._leds_released = True
+            time.sleep(0.05)
         rep_ = bytearray(max(self.out_length, 48))
         rep_[0] = 0x02
         rep_[2] = 0x10           # only the player dots are valid: rumble, lights and triggers are left alone
         rep_[44] = pattern | 0x20  # 0x20: change at once, no fade
-        written = wintypes.DWORD()
         return bool(ctypes.windll.kernel32.WriteFile(ctypes.c_void_p(self.whandle), bytes(rep_[:self.out_length]),
                                                      self.out_length, ctypes.byref(written), None))
 
@@ -1382,11 +1512,12 @@ class MINPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _MINPUTU)]
 
 
-def mouse(dx=0, dy=0, flags=0x0001):
-    """Move the pointer by (dx, dy) (flags 0x0001), or press / let go of the left button (0x0002 / 0x0004)."""
+def mouse(dx=0, dy=0, flags=0x0001, wheel=0):
+    """Move the pointer by (dx, dy) (flags 0x0001), press / let go of the left button (0x0002 / 0x0004), or turn
+    the wheel (flags 0x0800, wheel = +120 one notch up / zoom in, -120 down / zoom out)."""
     inp = MINPUT()
     inp.type = 0
-    inp.u.mi = MOUSEINPUT(int(dx), int(dy), 0, flags, 0, 0)
+    inp.u.mi = MOUSEINPUT(int(dx), int(dy), ctypes.c_uint32(int(wheel)).value, flags, 0, 0)
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(MINPUT))
 
 
@@ -1875,7 +2006,10 @@ def main():
     ap.add_argument("--device", default="DualSense", help="part of the sound device's name")
     ap.add_argument("--gain", type=float, default=1.0)
     ap.add_argument("--channels", default="3,4")
-    ap.add_argument("--all-screens", action="store_true")
+    ap.add_argument("--all-screens", action="store_true", default=True,
+                    help="look for the game on every monitor (the default)")
+    ap.add_argument("--primary-screen", dest="all_screens", action="store_false",
+                    help="only look on the main monitor")
     ap.add_argument("--hz", type=float, default=120)
     ap.add_argument("--debug", action="store_true", help="print every change of level it reads")
     ap.add_argument("--listen", action="store_true",
@@ -2262,7 +2396,9 @@ def main():
     wheel = {"sent": False, "last": None, "until": 0.0, "was_click": False, "releases": 0}
     squares_seen = [None]
     usb_check = [0.0]
+    steam_check = [-1000.0, False]
     lost_logged = [False]
+    last_good = [None]
     usb_report = [None, 0.0]  # what the addon was last told, and when
     dots = {"shown": None, "at": 0.0}
     last_chat = [None]
@@ -2299,6 +2435,14 @@ def main():
                     pass
                 hap = NullHaptics()
                 usb_check[0] = 0.0  # reopened just below
+            if t0 - steam_check[0] > 30:  # Steam running? Its controller support takes over the DualSense
+                steam_check[0] = t0
+                running = steam_running()
+                if running and not steam_check[1]:
+                    print("Steam is running: its PlayStation controller support takes over the DualSense (no HD "
+                          "vibration, its own player dots). Quit Steam, or turn off Steam > Settings > Controller > "
+                          "PlayStation Controller Support, then unplug and replug the controller.")
+                steam_check[1] = running
             if t0 - usb_check[0] > 5:  # plugged in or unplugged? (checked every 5 s)
                 usb_check[0] = t0
                 found = find_device(a.device)
@@ -2348,13 +2492,23 @@ def main():
                             left = max(0, int(cm - 2.5 * w) - 2)
                             right = int(cm + (STRIP - 2.5) * w) + 3
                             top = max(0, int(yc) - 1)
-                            pos = (left, top, right, top + 3, cm - left, w, yc - top)
-                            print(f"Found the squares at ({left}, {top}), each {w:.1f} pixels wide. Haptics on.")
+                            ox, oy = virtual_origin() if a.all_screens else (0, 0)  # (image -> screen coordinates)
+                            pos = (left + ox, top + oy, right + ox, top + 3 + oy, cm - left, w, yc - top)
+                            print(f"Found the squares at ({left + ox}, {top + oy}), each {w:.1f} pixels wide. Haptics on.")
                             state = "running"
                 else:
-                    img = ImageGrab.grab(bbox=pos[:4], all_screens=a.all_screens)
-                    arr = canon_strip(np.asarray(img.convert("RGB")), pos[4], pos[5], pos[6])
-                    dec = decode(arr, 0, 0)
+                    try:
+                        strip_px = grab_region(*pos[:4])
+                    except Exception:  # noqa: BLE001  (the slower way still works)
+                        strip_px = np.asarray(ImageGrab.grab(bbox=pos[:4], all_screens=a.all_screens).convert("RGB"))
+                    raw = canon_strip(strip_px, pos[4], pos[5], pos[6])
+                    arr, trusted = normalize_strip(raw)
+                    if trusted:
+                        last_good[0] = arr
+                    elif last_good[0] is not None:
+                        arr = last_good[0]  # chat, wheel, fishing and menus keep the last good reading (a dimmed or
+                        #                     covered strip read as nonsense: picks that were never made)
+                    dec = decode(arr, 0, 0) if trusted else None
                     chat_open = chat_flag(arr, 0, 0)
                     pad_events = []
                     if padw:
@@ -2425,6 +2579,10 @@ def main():
                                 time.sleep(0.2)
                             switch_channel(code - 1)
                             print("Chat channel:", CHANNELS[code - 1][0])
+                        elif code in (6, 7) and game_in_front():
+                            # the touchpad's map / chat zone: keys the addon bound to the game's own commands
+                            tap(0x74 if code == 6 else 0x75, (0x11, 0x10),
+                                "open the map" if code == 6 else "open chat")
                     # tell the addon whether the helper has the cable (a hidden key; never while chat is open)
                     on_usb = not isinstance(hap, NullHaptics)
                     if (on_usb != usb_report[0] or time.time() - usb_report[1] > 15) and not chan_state[0] \
@@ -2434,7 +2592,11 @@ def main():
                     # a menu is open in the game: the touchpad moves the mouse (only while the game is in front)
                     if padw:
                         want = menu_flag(arr, 0, 0) and game_in_front()
+                        padw.map_open = map_flag(arr, 0, 0)
                         if want != getattr(padw, "mouse_mode", False):
+                            if want:  # a press still held from opening the menu is ignored until let go
+                                padw._mheld = padw.click_since is not None
+                                padw._mdown = False
                             padw.mouse_mode = want
                             log_line("touchpad is " + ("the mouse (a menu is open)" if want else "the touchpad again"))
                     # your health on the five white dots (re-sent every second in case the game resets them)
@@ -2442,7 +2604,11 @@ def main():
                     if padw and hl is not None and not a.no_dots:
                         n = int(math.ceil(hl * 5 - 1e-6)) if hl > 0.004 else 0
                         if n != dots["shown"] or time.time() - dots["at"] > 1:
-                            if padw.set_dots(n):
+                            sent = padw.set_dots(n)
+                            if n != dots["shown"]:
+                                log_line(f"health dots: {n} of 5 (health {hl:.2f}) " + ("sent" if sent else
+                                         "NOT sent (the controller isn't on USB)"))
+                            if sent:
                                 dots["shown"], dots["at"] = n, time.time()
                     if mic and padw and not a.no_mic_button:
                         # the PS5 mic button: a quick click opens/closes chat, holding it listens
@@ -2522,7 +2688,7 @@ def main():
                     elif t0 - last_ok > 0.5 and not lost_logged[0]:
                         lost_logged[0] = True
                         log_line("strip unreadable, squares read: " + " ".join(
-                            "(%d,%d,%d)" % tuple(int(v) for v in arr[3, k * 6 + 3]) for k in range(STRIP)))
+                            "(%d,%d,%d)" % tuple(int(v) for v in raw[3, k * 6 + 3]) for k in range(STRIP)))
                     if not dec and t0 - last_ok > 0.5:
                         hap.set(0, 0)  # effects stop at once, but the weather carries on for a few seconds
                     if not dec and t0 - last_ok > 4.0:

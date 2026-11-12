@@ -19,6 +19,8 @@ THE TWO PARTS
 
 FOR THE HELPER
   - Plug the DualSense in with a USB cable for the full feel.
+  - Quit Steam while you play (or turn off Steam > Settings > Controller > PlayStation Controller Support):
+    Steam takes over the DualSense and the HD vibration and health dots stop working.
   - Play in windowed or borderless window mode (the helper reads a small strip of squares the addon draws in
     the top-left corner of the game to know what is happening).
   - Talk to type: click the PS5 mic button to open chat, hold it while you speak, let go and the words are typed.

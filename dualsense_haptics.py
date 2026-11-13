@@ -262,6 +262,31 @@ def locate_strip(arr):
     return None
 
 
+GAUGE = 10  # the health gauge after the squares, in squares
+
+
+def read_gauge(px, cm, w, yc, marker):
+    """Your health 0..1 from the gauge (white fill on black, GAUGE squares long, right after the squares), measured
+    on the raw grab; works in fights, when the game hides the exact number from addons. None if it can't be read."""
+    H, W = px.shape[:2]
+    yy = int(round(yc))
+    x0, x1 = int(round(cm + (STRIP - 2.5) * w)), int(round(cm + (STRIP + GAUGE - 2.5) * w))
+    if not (0 <= yy < H) or x1 > W or x1 - x0 < 10 or marker < 40:
+        return None
+    row = px[yy, x0:x1].astype(int).sum(axis=1) / 3.0
+    lit = row > marker * 0.5
+    return float(lit.sum()) / len(lit)
+
+
+def heartbeat_feel(t):
+    """An intense heartbeat for health under 20%: a hard lub, a slightly softer dub."""
+    if t < 90:
+        return 0.6, 1.6
+    if 150 < t < 250:
+        return 0.45, 1.2
+    return 0.0, 0.0
+
+
 def canon_strip(arr, cm, w, yc):
     """The strip's ten squares, each read at its true centre, laid out as clean 6x6 squares (60x6): the format every
     reader below expects, whatever size the game drew them."""
@@ -2396,6 +2421,7 @@ def main():
     wheel = {"sent": False, "last": None, "until": 0.0, "was_click": False, "releases": 0}
     squares_seen = [None]
     usb_check = [0.0]
+    heart = [0.0]
     steam_check = [-1000.0, False]
     lost_logged = [False]
     last_good = [None]
@@ -2490,7 +2516,7 @@ def main():
                             cm, w, yc = p
                             # grab just the strip's middle row, with a little room either side
                             left = max(0, int(cm - 2.5 * w) - 2)
-                            right = int(cm + (STRIP - 2.5) * w) + 3
+                            right = int(cm + (STRIP + GAUGE - 2.5) * w) + 3  # (the squares and the health gauge)
                             top = max(0, int(yc) - 1)
                             ox, oy = virtual_origin() if a.all_screens else (0, 0)  # (image -> screen coordinates)
                             pos = (left + ox, top + oy, right + ox, top + 3 + oy, cm - left, w, yc - top)
@@ -2502,6 +2528,9 @@ def main():
                     except Exception:  # noqa: BLE001  (the slower way still works)
                         strip_px = np.asarray(ImageGrab.grab(bbox=pos[:4], all_screens=a.all_screens).convert("RGB"))
                     raw = canon_strip(strip_px, pos[4], pos[5], pos[6])
+                    marker = float(raw[3, 2 * 6 + 3].astype(int)[0])  # (square 3's red: how bright "full" looks now)
+                    sq10 = raw[3, 9 * 6 + 3].astype(int)  # square 10's green: the addon says its gauge is drawn
+                    gauge_hl = read_gauge(strip_px, pos[4], pos[5], pos[6], marker) if sq10[1] > 128 else None
                     arr, trusted = normalize_strip(raw)
                     if trusted:
                         last_good[0] = arr
@@ -2601,6 +2630,13 @@ def main():
                             log_line("touchpad is " + ("the mouse (a menu is open)" if want else "the touchpad again"))
                     # your health on the five white dots (re-sent every second in case the game resets them)
                     hl = health_level(arr, 0, 0)
+                    if gauge_hl is not None and trusted:
+                        hl = gauge_hl  # (the gauge works in fights too; square 10 only out of them)
+                    # under 20% health (alive): an intense heartbeat, about 80 beats a minute
+                    if hl is not None and 0.004 < hl < 0.2 and not isinstance(hap, NullHaptics):
+                        if time.time() - heart[0] > 0.75:
+                            heart[0] = time.time()
+                            hap.play(heartbeat_feel, 300)
                     if padw and hl is not None and not a.no_dots:
                         n = int(math.ceil(hl * 5 - 1e-6)) if hl > 0.004 else 0
                         if n != dots["shown"] or time.time() - dots["at"] > 1:

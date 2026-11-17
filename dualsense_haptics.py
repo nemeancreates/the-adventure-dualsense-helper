@@ -25,9 +25,12 @@ import argparse
 import collections
 import ctypes
 import datetime
+import difflib
+import json
 import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -263,6 +266,35 @@ def locate_strip(arr):
 
 
 GAUGE = 10  # the health gauge after the squares, in squares
+TEXT = 24   # after the gauge, shown only for a moment: a pet name, 2 squares (6 on/off colours) a letter
+
+
+def read_text(px, cm, w, yc, marker):
+    """The pet name the addon spells out after the gauge (while square 5 is red): a-z = 1-26, ' = 27, space = 28,
+    - = 29, 0 = the end. Words come back capitalised ("Peak"). None if it can't be read."""
+    H, W = px.shape[:2]
+    yy = int(round(yc))
+    if not (0 <= yy < H) or marker < 40:
+        return None
+    out = ""
+    for j in range(12):
+        v = 0
+        for half in range(2):
+            k = STRIP + GAUGE + 2 * j + half + 1
+            xx = int(round(cm + (k - 3) * w))
+            if xx >= W:
+                return None
+            m = px[yy, xx].astype(int)
+            for c in range(3):
+                if m[c] > marker * 0.5:
+                    v |= 1 << (half * 3 + c)
+        if v == 0:
+            break
+        if v > 29:
+            return None
+        out += chr(96 + v) if v <= 26 else {27: "'", 28: " ", 29: "-"}[v]
+    out = out.strip()
+    return " ".join(x[:1].upper() + x[1:] for x in out.split(" ")) if out else None
 
 
 def read_gauge(px, cm, w, yc, marker):
@@ -343,6 +375,18 @@ def mic_flag(arr, x, y):
     return bool(m[0] > 200 and m[1] > 200 and m[2] < 90)
 
 
+def pet_send_flag(arr, x, y):
+    """Square 5 red only: the addon is showing the pet name you saved, spelled out after the gauge."""
+    b = _bits(arr, x, y, 5)
+    return bool(b and b[0] and not b[1] and not b[2])
+
+
+def pet_name_flag(arr, x, y):
+    """Square 5 green only: Settings' "Record your pet's name" was pressed - listen 4 s for the name."""
+    b = _bits(arr, x, y, 5)
+    return bool(b and b[1] and not b[0] and not b[2])
+
+
 def _bits(arr, x, y, k):
     """Square k's red, green and blue as on/off (the exact things are sent that way)."""
     if arr.shape[1] < x + 6 * k:
@@ -397,6 +441,31 @@ def map_flag(arr, x, y):
     """Square 11's blue: the world map is open (a touchpad click on its left / right side zooms out / in)."""
     b = _bits(arr, x, y, 11)
     return bool(b and b[2])
+
+
+def trigger_feel(arr, x, y):
+    """How R2 should feel when you're not fishing (square 14's red and green): 0 slack, 1 a bow being drawn, 2 a
+    spell being cast."""
+    a, b = _bits(arr, x, y, 7), _bits(arr, x, y, 14)
+    if a is None or b is None or a[0] or a[1]:
+        return 0
+    return b[0] + 2 * b[1]
+
+
+def speaker_flag(arr, x, y):
+    """Square 5 blue (and not yellow): the addon asks for a chime on the controller's speaker."""
+    b = _bits(arr, x, y, 5)
+    return bool(b and b[2] and not b[0])
+
+
+def chime_samples():
+    """A short two-note chime (rising fifth), for the controller's own speaker."""
+    out = []
+    for hz, secs in ((880.0, 0.13), (1318.5, 0.22)):
+        n = np.arange(int(RATE * secs))
+        env = np.exp(-n / (RATE * secs * 0.45)) * np.minimum(1.0, n / (RATE * 0.004))
+        out.append(np.sin(2 * math.pi * hz * n / RATE) * env * 0.55)
+    return np.concatenate(out)
 
 
 def chat_flag(arr, x, y):
@@ -1160,7 +1229,14 @@ class WhisperMic:
         g = min(30.0, 0.1 / loud)
         return (np.tanh(a * g * 1.4) / 1.4).astype(np.float32)
 
-    def transcribe(self, audio, fs, keep_as=None):
+    def transcribe(self, audio, fs, keep_as=None, hint=None, fast=False):
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            lock = self._lock = threading.Lock()
+        with lock:
+            return self._transcribe(audio, fs, keep_as, hint, fast)
+
+    def _transcribe(self, audio, fs, keep_as=None, hint=None, fast=False):
         a = to_16k(audio, fs)
         self.why = ""
         if len(a) == 0:
@@ -1183,7 +1259,7 @@ class WhisperMic:
         raw = a
         a = self.level_up(a)
         segs, _ = self.model.transcribe(
-            a, language="en", beam_size=5, initial_prompt=WOW_HINT, condition_on_previous_text=False,
+            a, language="en", beam_size=1 if fast else 5, initial_prompt=hint or WOW_HINT, condition_on_previous_text=False,
             vad_filter=True, vad_parameters={"threshold": 0.25, "min_silence_duration_ms": 700, "speech_pad_ms": 400})
         text = " ".join(seg.text.strip() for seg in segs).strip()
         if text.lower().strip(" .!?") in NOISE_WORDS and level < 0.01:
@@ -1237,6 +1313,220 @@ def get_model(model="small.en"):
     print(f"Downloading the {model} speech model (about 480 MB, once)...")
     path = download_model(model)
     print("Done - the speech model is in", path)
+
+
+# ---- pet voice commands: "Rex, attack" ------------------------------------------------------------------------------
+SETTINGS_FILE = os.path.join(APP_DIR, "helper_settings.json")
+PET_WAKE = ["pet", "companion", "minion", "demon", "imp", "voidwalker", "succubus", "felhunter", "felguard"]
+PET_COMMANDS = [  # (macro button 1-7 in the addon, phrases)
+    (1, ["attack", "kill", "get him", "get it", "sic", "sic him", "go get"]),
+    (2, ["follow me", "follow", "heel", "come here", "come back", "come", "to me"]),
+    (3, ["stay there", "stay", "stop", "wait", "hold", "sit"]),
+    (4, ["passive", "stand down", "peace", "calm down", "be good"]),
+    (5, ["defensive", "protect me", "protect", "guard", "defend"]),
+    (6, ["assist me", "assist", "help me", "help"]),
+    (7, ["move to", "move there", "go there", "go to", "over there"]),
+]
+PET_NAMES_SAY = [
+    r"\b(?:my|the)\s+(?:pet|demon|minion|companion)(?:'s)?\s+(?:name\s+is|is\s+called|is\s+named|is)\s+([a-z']+)",
+    r"\b(?:call|name|rename)\s+(?:my|the)\s+(?:pet|demon|minion|companion)\s+([a-z']+)",
+]
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_settings(d):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log_line(f"could not save helper_settings.json: {e!r}")
+
+
+def parse_pet_command(text, names):
+    """"Rex, attack!" -> (1, None). A pet name (or pet / demon / minion...) must come first, so ordinary talk to
+    friends never sends your pet anywhere. "my pet is called Rex" -> (None, "Rex"). (None, None) if neither."""
+    low = re.sub(r"[^a-z' ]+", " ", text.lower()).strip()
+    low = re.sub(r"\s+", " ", low)
+    for rx in PET_NAMES_SAY:
+        m = re.search(rx, low)
+        if m:
+            return None, m.group(1).capitalize()
+    words = low.split(" ")
+    wake = [w.lower() for w in PET_WAKE] + [n.lower() for n in names]
+    for i, w in enumerate(words[:3]):  # (the name is the first word or so)
+        hit = w in wake or any(len(n) >= 3 and difflib.SequenceMatcher(None, w, n).ratio() >= 0.78 for n in wake)
+        if not hit:
+            continue
+        rest = " " + " ".join(words[i + 1:]) + " "
+        best = None
+        for button, phrases in PET_COMMANDS:
+            for ph in phrases:
+                pos = rest.find(" " + ph)
+                if pos >= 0 and (best is None or pos < best[0] or (pos == best[0] and len(ph) > best[2])):
+                    best = (pos, button, len(ph))
+        if best:
+            return best[1], None
+    return None, None
+
+
+class PetVoice(threading.Thread):
+    """Open microphone, on this PC only: waits for speech, turns each short phrase into text, and if it starts with
+    your pet's name (or "pet" / "demon" / ...) and a command, presses that command's key in the game. Nothing is
+    kept or sent anywhere. It stands aside while you talk to type or type in chat."""
+
+    def __init__(self, mic, busy, front, press, ack):
+        super().__init__(daemon=True)
+        self.mic, self.busy, self.front, self.press, self.ack = mic, busy, front, press, ack
+        self.settings = load_settings()
+        self.names = [n for n in self.settings.get("pet_names", []) if isinstance(n, str)]
+        self.recording = False
+        self.buzz = None  # one short buzz: "speak now"
+
+    def add_names(self, text):
+        for n in re.split(r"[,;]", text or ""):
+            n = n.strip()
+            if n and n.lower() not in [x.lower() for x in self.names]:
+                self.names.append(n)
+        self.settings["pet_names"] = self.names
+        save_settings(self.settings)
+
+    FILLER = {"my", "pet", "pets", "pet's", "demon", "is", "called", "named", "name", "names", "the", "his", "her",
+              "its", "it's", "um", "uh", "a", "and", "so", "ok", "okay", "oh"}
+
+    def record_name(self, seconds=4.0):
+        """Settings' button: one short buzz, 4 seconds of listening, and the first word that isn't filler ("Rex", or
+        "my pet is called Rex") is typed into the game's "Is this what you meant?" box. Saving there sends it back
+        (save_name)."""
+        if self.recording:
+            return
+        self.recording = True
+        try:
+            if getattr(self.mic, "model", None) is None:
+                print("Pet name: the speech model isn't loaded, so nothing could be heard.")
+                return
+            time.sleep(0.5)  # (pet voice's own listening lets go of the mic first)
+            cap = MicCapture(self.mic.device_name, strict=not getattr(self.mic, "fallback", False))
+            cap.start()
+            cap.ready.wait(2)
+            if cap.error:
+                print("Pet name: couldn't open the microphone:", cap.error)
+                return
+            if self.buzz:
+                self.buzz()
+            print(f"Pet name: listening for {seconds:.0f} seconds...")
+            time.sleep(seconds)
+            audio, fs = cap.finish()
+            if len(audio) < fs * 0.3 or float(np.max(np.abs(audio))) < 0.003:
+                print("Pet name: heard no sound from the microphone (if it stays silent, turn the controller fully "
+                      "off and on again).")
+                return
+            text = self.mic.transcribe(audio, fs, hint="A pet's name, said once.") or ""
+            _, learned = parse_pet_command(text, self.names)
+            if not learned:
+                words = re.sub(r"[^a-z' ]+", " ", text.lower()).split()
+                words = [w for w in words if w not in self.FILLER]
+                learned = words[0].strip("'").capitalize() if words else None
+            if not learned:
+                print(f"Pet name: didn't catch a name (heard: {text.strip() or 'nothing'}). Type it in the box.")
+                return
+            print(f"Pet name: heard {learned} - check it in the game's box, then Save.")
+            if self.front():
+                type_text(learned[:12])  # (into the box, which has the keyboard)
+            if self.buzz:
+                self.buzz()
+        except Exception as e:  # noqa: BLE001
+            log_line(f"pet name recording error: {e!r}")
+        finally:
+            self.recording = False
+
+    def hint(self):
+        """What the speech engine is told to expect: commands to a pet (not chat, so no city names to imagine)."""
+        return ("Talking to my pet" + (", " + ", ".join(self.names) if self.names else "")
+                + ": attack, follow, stay, passive, defensive, assist, move to.")
+
+    def save_name(self, name):
+        self.add_names(name)
+        print(f"Pet name saved: {name}.  Say \"{name}, attack\" and so on. Saved names: " + ", ".join(self.names))
+        self.ack()
+
+    def handle(self, text):
+        button, learned = parse_pet_command(text, self.names)
+        if learned:
+            self.add_names(learned)
+            print(f"Pet voice: I'll answer to {learned} now.")
+            self.ack()
+        elif button:
+            names = {1: "attack", 2: "follow", 3: "stay", 4: "passive", 5: "defensive", 6: "assist", 7: "move to"}
+            print(f"Pet voice: {names[button]}  (heard: {text.strip()})")
+            self.press(button)
+            self.ack()
+        else:
+            log_line(f"pet voice heard something else: {text.strip()[:60]}")
+
+    def run(self):
+        cap, idx, start, last_loud, floor, loud_time = None, 0, None, 0.0, 0.002, 0.0
+        while True:
+            try:
+                if getattr(self.mic, "model", None) is None or self.busy() or not self.front() \
+                        or self.recording:
+                    if cap is not None:
+                        cap.finish()
+                        cap, idx, start = None, 0, None
+                    time.sleep(0.4)
+                    continue
+                if cap is None:
+                    cap = MicCapture(self.mic.device_name, strict=not getattr(self.mic, "fallback", False))
+                    cap.start()
+                    cap.ready.wait(2)
+                    if cap.error:
+                        cap = None
+                        time.sleep(5)
+                        continue
+                    idx, start = 0, None
+                time.sleep(0.12)
+                chunks = cap.chunks
+                n = len(chunks)
+                if n > idx:
+                    new = np.concatenate(chunks[idx:n])
+                    rms = float(np.sqrt(np.mean(new ** 2))) if len(new) else 0.0
+                    # (11-16: background sound set this off every ~15 s and each guess cost the game frames, so
+                    # only clear speech, well above the room's own level, counts)
+                    loud = rms > max(0.015, floor * 4.0)
+                    if not loud:
+                        floor = 0.97 * floor + 0.03 * max(rms, 0.0004)
+                    now = time.time()
+                    if loud:
+                        if start is None:
+                            start = idx
+                            loud_time = 0.0
+                        loud_time += 0.12
+                        last_loud = now
+                    idx = n
+                    if start is not None and (now - last_loud > 0.7 or (n - start) > 400):
+                        audio = np.concatenate(chunks[start:n])
+                        fs = cap.fs
+                        start = None
+                        dur = len(audio) / float(fs)
+                        # a command is short: 0.4-4 s, and loud for at least a third of a second
+                        if 0.4 < dur < 4.0 and loud_time >= 0.35:
+                            text = self.mic.transcribe(audio, fs, hint=self.hint(), fast=True)
+                            if text:
+                                self.handle(text)
+                    if start is None and idx > 0:
+                        del chunks[:idx]  # (what has been looked at is not kept)
+                        idx = 0
+            except Exception as e:  # noqa: BLE001
+                log_line(f"pet voice error (carrying on): {e!r}")
+                cap = None
+                time.sleep(2)
 
 
 class PadWatcher(threading.Thread):
@@ -1313,6 +1603,9 @@ class PadWatcher(threading.Thread):
                 if "vid_054c" in low or "vid&0002054c" in low:  # USB, or Bluetooth
                     paths.append(path)
             index += 1
+        # the cable first: a controller still paired by Bluetooth shows up twice, and the Bluetooth copy can't take
+        # the dots, the lights or the HD vibration
+        paths.sort(key=lambda p_: 0 if "vid_054c" in p_.lower() else 1)
         for path in paths:
             for access in (0xC0000000, 0x80000000):
                 h = k32.CreateFileW(path, access, 3, None, 3, 0, None)
@@ -1391,6 +1684,18 @@ class PadWatcher(threading.Thread):
                 self._as_mouse(contact, tx, (report[35 + off] >> 4) | (report[36 + off] << 4), click)
             elif getattr(self, "_mlast", None) is not None or getattr(self, "_mdown", False):
                 self._as_mouse(0x80, 0, 0, False)  # menu closed: let go of everything
+            # the click itself, passed to the addon as the numpad * key (down and up, so holds work) - unless a menu
+            # is open (then it is the mouse), chat is open (then Escape closes it) or the game isn't in front
+            if click and self.click_since is None:
+                if not getattr(self, "mouse_mode", False) and getattr(self, "click_ok", False):
+                    if getattr(self, "chat_is_open", False):
+                        tap(0x1B, (), "close chat (touchpad click)")
+                    else:
+                        _key(0x6A, False)
+                        self._kdown = True
+            elif not click and getattr(self, "_kdown", False):
+                self._kdown = False
+                _key(0x6A, True)
             if click and self.click_since is None:
                 self.click_since = time.time()
             elif not click:
@@ -1467,6 +1772,21 @@ class PadWatcher(threading.Thread):
             self._mdown = click
             mouse(flags=0x0002 if click else 0x0004)
 
+    def set_speaker(self, on):
+        """Sends the sound on channels 1-2 to the controller's own speaker (on) or back to its headphone jack."""
+        if not (self.whandle and self.usb):
+            return False
+        rep_ = bytearray(max(self.out_length, 48))
+        rep_[0] = 0x02
+        rep_[1] = 0x20 | 0x80   # speaker volume and audio routing are valid
+        rep_[2] = 0x80          # the speaker's amplifier setting is valid too
+        rep_[6] = 0x64          # speaker volume
+        rep_[8] = 0x30 if on else 0x00
+        rep_[38] = 0x02         # speaker amplifier gain (the 11-16 test chime, heard on the controller)
+        written = wintypes.DWORD()
+        return bool(ctypes.windll.kernel32.WriteFile(ctypes.c_void_p(self.whandle), bytes(rep_[:self.out_length]),
+                                                     self.out_length, ctypes.byref(written), None))
+
     def set_trigger(self, effect):
         """R2's resistance: effect = up to 11 bytes (mode, then its settings). USB only; True if the pad took it."""
         if not (self.whandle and self.usb):
@@ -1506,6 +1826,8 @@ class PadWatcher(threading.Thread):
                                                      self.out_length, ctypes.byref(written), None))
 
 
+TRIGGER_DRAW = [0x01, 40, 150]            # from a third of the pull, a firm steady pull-back: a bowstring
+TRIGGER_CAST = [0x06, 9, 70, 10]          # a soft slow throb while a spell is being cast
 TRIGGER_OFF = [0x05]                      # no resistance
 TRIGGER_TENSION = [0x01, 30, 70]          # from 12% of the pull, a light steady resistance: a taut line
 TRIGGER_TUG = [0x06, 14, 220, 20]         # the trigger throbs (14 a second): something is pulling
@@ -1547,7 +1869,7 @@ def mouse(dx=0, dy=0, flags=0x0001, wheel=0):
 
 
 EXTENDED_KEYS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E}  # page/home/end/arrows/ins/del
-KEY_NAMES = {0x76: "F7", 0x77: "F8", 0x0D: "Enter", 0x1B: "Escape", 0x20: "Space", 0x24: "Home", 0x56: "V", 0x78: "F9", 0x79: "F10",
+KEY_NAMES = {0x70: "F1", 0x71: "F2", 0x72: "F3", 0x73: "F4", 0x74: "F5", 0x75: "F6", 0x12: "Alt", 0x76: "F7", 0x77: "F8", 0x0D: "Enter", 0x1B: "Escape", 0x20: "Space", 0x24: "Home", 0x56: "V", 0x78: "F9", 0x79: "F10",
              0x7A: "F11", 0x11: "Ctrl", 0x10: "Shift"}
 user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype = wintypes.UINT
@@ -1904,6 +2226,7 @@ class Haptics:
         self.cur = [0.0, 0.0]
         self.gain = gain
         self.weather = Weather()
+        self.speaker = None           # samples waiting to be played on the controller's speaker (channels 1-2)
         self.cols = [c - 1 for c in channels]
         self.phase_w = 0.0
         self.phase_s = 0.0
@@ -1966,7 +2289,18 @@ class Haptics:
                 one = sig + (wl if k % 2 == 0 else wr_) * self.gain
                 one = np.tanh(1.6 * one) / math.tanh(1.6)  # soft squash: loud hits get fuller and punchier, not harsh
                 out[:, c] = (np.clip(one, -1.0, 1.0) * 32000).astype(np.int16)
+        sp = self.speaker
+        if sp is not None and len(sp):
+            part = sp[:CHUNK]
+            self.speaker = sp[CHUNK:] if len(sp) > CHUNK else None
+            pcm = (np.clip(part, -1.0, 1.0) * 30000).astype(np.int16)
+            for c in (0, 1):
+                if c not in self.cols:
+                    out[:len(pcm), c] = pcm
         return out.reshape(-1)
+
+    def chime(self):
+        self.speaker = chime_samples()
 
     def _feed(self):
         errors = 0
@@ -2046,6 +2380,9 @@ def main():
     ap.add_argument("--indoors-dampen", type=float, default=0.1,
                     help="with --listen: weather strength left when it hears the inside roof patter (default 0.1)")
     ap.add_argument("--no-mic", action="store_true", help="turn talk to type off (on by default)")
+    ap.add_argument("--pet-voice", action="store_true",
+                    help="open-mic pet commands for hunters and warlocks: say \"Rex, attack\" (off by default)")
+    ap.add_argument("--pet-name", default="", help="your pet's name(s), comma separated, for --pet-voice")
     ap.add_argument("--mic-keep", action="store_true",
                     help="keep your talk-to-type recordings in mic_samples (newest 60) to tune it; off by default")
     ap.add_argument("--no-mic-keep", action="store_true", help=argparse.SUPPRESS)  # (the old switch; now the default)
@@ -2092,6 +2429,14 @@ def main():
                     "(every 30 s while it sounds stormy)")
     ap.add_argument("--log-dir", default=os.path.join(APP_DIR, "sound_log"))
     a = ap.parse_args()
+    try:  # the game comes first: the helper gives way when the PC is busy (11-16: frame drops while it transcribed)
+        _k = ctypes.windll.kernel32
+        _k.GetCurrentProcess.restype = ctypes.c_void_p
+        _k.SetPriorityClass.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        if not _k.SetPriorityClass(_k.GetCurrentProcess(), 0x00004000):  # BELOW_NORMAL_PRIORITY_CLASS
+            log_line("couldn't lower the helper's priority")
+    except Exception:  # noqa: BLE001
+        pass
     if a.get_model:
         get_model(a.mic_model)
         return
@@ -2372,6 +2717,31 @@ def main():
             padw.start()
             print("Fishing: you feel the bobber and the bite (you hook with your own button).")
     fisher = Fisher(hap, padw, a)
+    pet_voice = None
+    _ps = load_settings()
+    if mic is not None and hasattr(mic, "transcribe") and getattr(mic, "early", False):
+        def _pet_press(i):
+            # Ctrl+Alt+F1-F7: the addon's pet buttons (not the number pad: keys are sent by position, and the game
+            # read those as Home / End / arrows; Ctrl+Shift F5-F11 are taken by the helper's other keys)
+            tap(0x6F + i, (0x11, 0x12), f"pet command {i}")
+
+        def _pet_ack():
+            if not isinstance(hap, NullHaptics):
+                hap.play(lambda ms: (0.5, 0.0) if ms < 60 or 120 < ms < 170 else (0.0, 0.0), 200)
+
+        def _pet_buzz():
+            if not isinstance(hap, NullHaptics):
+                hap.play(lambda ms: (0.6, 0.0) if ms < 90 else (0.0, 0.0), 100)
+
+        pet_voice = PetVoice(mic, lambda: pad_listening or chat_open or mic_on, game_in_front, _pet_press, _pet_ack)
+        pet_voice.buzz = _pet_buzz
+        if a.pet_name:
+            pet_voice.add_names(a.pet_name)
+        if a.pet_voice or _ps.get("pet_voice"):
+            pet_voice.start()
+            print("Pet voice commands are on: say \"<your pet's name>, attack / follow / stay / passive / defensive / "
+                  "assist / move to\". Names: " + (", ".join(pet_voice.names) or "none yet - say \"my pet is called "
+                                                    "Rex\" or use Settings > Record your pet's name"))
     listener = analyzer = slog = None
     if a.listen:
         analyzer = Analyzer(a.listen_sens)
@@ -2422,6 +2792,7 @@ def main():
     squares_seen = [None]
     usb_check = [0.0]
     heart = [0.0]
+    extras = {"trigger": 0, "chime": False, "chime_off": 0.0}
     steam_check = [-1000.0, False]
     lost_logged = [False]
     last_good = [None]
@@ -2516,7 +2887,7 @@ def main():
                             cm, w, yc = p
                             # grab just the strip's middle row, with a little room either side
                             left = max(0, int(cm - 2.5 * w) - 2)
-                            right = int(cm + (STRIP + GAUGE - 2.5) * w) + 3  # (the squares and the health gauge)
+                            right = int(cm + (STRIP + GAUGE + TEXT - 2.5) * w) + 3  # (squares, gauge, pet name)
                             top = max(0, int(yc) - 1)
                             ox, oy = virtual_origin() if a.all_screens else (0, 0)  # (image -> screen coordinates)
                             pos = (left + ox, top + oy, right + ox, top + 3 + oy, cm - left, w, yc - top)
@@ -2562,6 +2933,40 @@ def main():
                         squares_seen[0] = sq
                         log_line(f"addon says: fishing {sq[0]} | chat {sq[1]} | wheel request {sq[2]} | weather rain/wind {sq[3]}")
                     fisher.update(fish_flag(arr, 0, 0), pad_events)
+                    # R2's feel outside fishing: a bow being drawn, a spell being cast
+                    if padw and trusted and not a.no_triggers and fish_flag(arr, 0, 0) is None:
+                        tf = trigger_feel(arr, 0, 0)
+                        if tf != extras["trigger"]:
+                            extras["trigger"] = tf
+                            padw.set_trigger({1: TRIGGER_DRAW, 2: TRIGGER_CAST}.get(tf, TRIGGER_OFF))
+                            log_line(f"R2 feel: {['slack', 'bow draw', 'spell cast', 'slack'][tf]}")
+                    # a chime on the controller's speaker (a rare nearby, a whisper)
+                    want_chime = trusted and speaker_flag(arr, 0, 0)
+                    if want_chime and not extras["chime"] and padw and not isinstance(hap, NullHaptics):
+                        padw.set_speaker(True)
+                        hap.chime()
+                        extras["chime_off"] = time.time() + 1.0
+                        log_line("speaker chime")
+                    extras["chime"] = want_chime
+                    want_pn = trusted and pet_name_flag(arr, 0, 0)
+                    if want_pn and not extras.get("petname"):
+                        if pet_voice is None:
+                            print("Pet name: talk to type's speech model isn't on, so the helper can't listen.")
+                        elif not pet_voice.recording:
+                            threading.Thread(target=pet_voice.record_name, daemon=True).start()
+                    extras["petname"] = want_pn
+                    if trusted and pet_send_flag(arr, 0, 0) and pet_voice is not None:
+                        nm = read_text(strip_px, pos[4], pos[5], pos[6], marker)
+                        if nm and nm == extras.get("petsend_seen") and nm != extras.get("petsend_done"):
+                            extras["petsend_done"] = nm
+                            pet_voice.save_name(nm)
+                        extras["petsend_seen"] = nm
+                    elif not (trusted and pet_send_flag(arr, 0, 0)):
+                        extras["petsend_seen"] = extras["petsend_done"] = None
+                    if extras["chime_off"] and time.time() > extras["chime_off"]:
+                        extras["chime_off"] = 0.0
+                        if padw:
+                            padw.set_speaker(False)
                     chan_state[0] = chan_flag(arr, 0, 0)
                     if chan_state[0] != last_chat[0]:  # say what it sees, so it is clear when chat is open
                         last_chat[0] = chan_state[0]
@@ -2620,8 +3025,11 @@ def main():
                         usb_report[0], usb_report[1] = on_usb, time.time()
                     # a menu is open in the game: the touchpad moves the mouse (only while the game is in front)
                     if padw:
-                        want = menu_flag(arr, 0, 0) and game_in_front()
+                        front = game_in_front()
+                        want = menu_flag(arr, 0, 0) and front
                         padw.map_open = map_flag(arr, 0, 0)
+                        padw.click_ok = front and trusted   # (the touchpad click goes to the game as a key)
+                        padw.chat_is_open = bool(chat_open)
                         if want != getattr(padw, "mouse_mode", False):
                             if want:  # a press still held from opening the menu is ignored until let go
                                 padw._mheld = padw.click_since is not None

@@ -27,6 +27,14 @@ FOR THE HELPER
     If the controller's mic sends no sound, turn the controller fully off (unplug it, hold PS for 10 seconds)
     and plug it back in.
 
+PET VOICE COMMANDS (hunters and warlocks, optional)
+  Start the helper with --pet-voice (or put "pet_voice": true in helper_settings.json next to it) and say your pet's
+  name and a command: "Rex, attack", "Rex, follow me", "stay", "passive", "defensive", "assist", "move to".
+  "Pet" or "demon" works as a name too. Teach it the name with Settings > Pet and totems > "Record your pet's name"
+  (say it after the buzz, check or fix what it heard in the box, then Save), out loud ("my pet is called Rex"), or
+  start with --pet-name Rex. It only listens while the game is in front and you are not typing or using talk to type, and
+  only acts when a command follows the name, so normal talk does nothing. Nothing is recorded or sent anywhere.
+
 PRIVACY
   Speech is turned into text on your PC. Nothing you say, and nothing from the game, is sent anywhere. The only
   download is the speech model, and only if you say yes. Recordings are not kept.

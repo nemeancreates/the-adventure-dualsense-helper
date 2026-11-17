@@ -10,3 +10,4 @@ build/
 dist/
 *.spec
 dots_test_log.txt
+helper_settings.json
